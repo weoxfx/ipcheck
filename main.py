@@ -1,20 +1,3 @@
-"""
-Xeo IP Verification Server — Fixed for Mini App / Web App usage
-Deploy on Render/Railway.
-
-Environment variables:
-  SECRET  — same random string as in your main bot
-  PORT    — set automatically by platform
-
-No BOT_TOKEN needed here at all!
-
-Flow:
-  1. Bot sends user a Mini App button: https://your-app.onrender.com/verify?token=XXXX
-  2. User opens it inside Telegram — server reads real IP, stores result
-  3. Bot polls /result?token=XXXX to get the IP hash
-  4. Bot records it and grants/blocks access
-"""
-
 import os
 import hashlib
 import hmac
@@ -26,37 +9,50 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger(__name__)
 
 app    = Flask(__name__)
-SECRET = os.environ.get("SECRET", "xeo_fp_secret_change_me")
+SECRET = os.environ.get("SECRET", "xeo_fp_secret_change_sureiwillchangeyoufreakme")
 
 # In-memory store: token -> {"ip_hash": ..., "user_id": ..., "ts": ...}
 results = {}
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def verify_token(token: str, max_age: int = 300):
+def verify_token(token: str, max_age: int = 3600):
     """
     Returns user_id if token valid and not expired, else None.
     Token format: {uid}_{timestamp}_{hmac16hex}
-    Uses rsplit to safely handle any underscores (though hex has none).
+    
+    This version supports both:
+    1. Standard timestamps (seconds since epoch)
+    2. Windowed timestamps (rounded to 1800s)
     """
     try:
-        # Use rsplit to split from right — handles edge cases safely
         parts = token.strip().rsplit("_", 2)
         if len(parts) != 3:
-            log.warning(f"Bad token format, parts={len(parts)}: {token[:40]}")
+            log.warning(f"Bad token format: {token[:40]}")
             return None
 
         uid_str, ts_str, sig = parts
         uid = int(uid_str)
         ts  = int(ts_str)
 
-        age = time.time() - ts
+        # Check if it's a windowed timestamp (usually divisible by 1800)
+        # or a raw second timestamp.
+        now = time.time()
+        
+        # If the timestamp is very small (e.g. < 10^9), it's likely not a modern epoch.
+        # But here they are standard epochs.
+        
+        age = now - ts
         log.info(f"Token age: {age:.1f}s for uid={uid}")
 
+        # Verification logic: 
+        # Windowed tokens (rounded to 1800) can appear to be up to 1800s "old" immediately
+        # or even slightly in the "future" if clocks aren't synced.
+        # We allow a generous 1 hour (3600s) window and 60s future buffer.
         if age > max_age:
             log.warning(f"Token expired: age={age:.1f}s > max={max_age}s")
             return None
-        if age < 0:
+        if age < -60: 
             log.warning(f"Token from future: age={age:.1f}s")
             return None
 
@@ -69,14 +65,13 @@ def verify_token(token: str, max_age: int = 300):
 
         return uid
     except Exception as e:
-        log.error(f"Token verify error: {e} | token={token[:50]}")
+        log.error(f"Token verify error: {e}")
         return None
 
 def hash_ip(ip: str) -> str:
     return hashlib.sha256((SECRET + ip).encode()).hexdigest()
 
 def get_real_ip() -> str:
-    # Try headers in order of reliability
     for header in ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP", "True-Client-IP"):
         val = request.headers.get(header, "").split(",")[0].strip()
         if val:
@@ -87,11 +82,11 @@ def get_real_ip() -> str:
 
 @app.route("/verify")
 def verify():
-    """User opens this link (as Mini App or browser). We read their IP."""
     token = request.args.get("token", "").strip()
     log.info(f"Verify request: token={token[:40]}... ip={get_real_ip()}")
 
-    user_id = verify_token(token)
+    # We allow 1 hour for the link to be clicked
+    user_id = verify_token(token, max_age=3600)
 
     if not user_id:
         log.warning(f"Invalid/expired token: {token[:40]}")
@@ -100,23 +95,20 @@ def verify():
     ip      = get_real_ip()
     ip_hash = hash_ip(ip)
 
-    # Store result — overwrite if user retries
     results[token] = {
         "ip_hash": ip_hash,
         "user_id": user_id,
         "ts":      time.time()
     }
-    log.info(f"Verified uid={user_id} ip={ip[:8]}... stored")
+    log.info(f"Verified uid={user_id} stored")
 
     return _success_page()
 
 
 @app.route("/result")
 def result():
-    """Bot polls this endpoint after user taps 'Done'."""
     token = request.args.get("token", "").strip()
 
-    # Clean up old results (older than 15 min)
     now     = time.time()
     expired = [k for k, v in results.items() if now - v["ts"] > 900]
     for k in expired:
@@ -125,8 +117,7 @@ def result():
     if token not in results:
         return jsonify({"ready": False})
 
-    data = results.pop(token)  # consume — one use only
-    log.info(f"Result polled for uid={data['user_id']}")
+    data = results.pop(token)
     return jsonify({
         "ready":   True,
         "ip_hash": data["ip_hash"],
@@ -192,7 +183,6 @@ def _success_page():
   <script>
     Telegram.WebApp.ready();
     Telegram.WebApp.expand();
-    // Auto-close after 3 seconds
     setTimeout(() => { try { Telegram.WebApp.close(); } catch(e){} }, 3000);
   </script>
 </body>
